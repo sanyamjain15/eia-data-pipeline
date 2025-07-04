@@ -17,7 +17,7 @@ EIA_API_KEY = os.getenv("EIA_API_KEY")
 EMAIL_ID = os.getenv("SMTP_USER")
 DATA_DIR = "/opt/airflow/data"
 
-def failure_email_alert(context):
+def notify_failure(context):
     """
     Sends an email alert when any task fails in the DAG.
     Includes task name, dag id, error details, and execution date.
@@ -590,49 +590,49 @@ with DAG(
     retry_delay=timedelta(minutes=5),
     execution_timeout=timedelta(minutes=2),
     provide_context=True,
-    on_failure_callback=failure_email_alert,
+    on_failure_callback=notify_failure,
     )
 
     pre_dq_check_fuel = PythonOperator(
         task_id="run_pre_ingestion_dq_fuel",
         python_callable=run_pre_ingestion_dq_fuel,
         provide_context=True,
-        on_failure_callback=failure_email_alert,
+        on_failure_callback=notify_failure,
     )
 
     load_fuel_task = PythonOperator(
     task_id="load_eia_fuel_data",
     python_callable=load_eia_fuel_data,
     provide_context=True,
-    on_failure_callback=failure_email_alert,
+    on_failure_callback=notify_failure,
     )
 
     pre_dq_check_sales = PythonOperator(
     task_id="run_pre_ingestion_dq_sales",
     python_callable=run_pre_ingestion_dq_sales,
     provide_context=True,
-    on_failure_callback=failure_email_alert,
+    on_failure_callback=notify_failure,
     )
 
     fetch_sales_task = PythonOperator(
     task_id="fetch_eia_sales_data",
     python_callable=fetch_eia_sales_data,
     provide_context=True,
-    on_failure_callback=failure_email_alert,
+    on_failure_callback=notify_failure,
     )
 
     load_sales_task = PythonOperator(
     task_id="load_eia_sales_data",
     python_callable=load_eia_sales_data,
     provide_context=True,
-    on_failure_callback=failure_email_alert,
+    on_failure_callback=notify_failure,
     )
 
     post_dq_check = PythonOperator(
     task_id="post_ingestion_dq_check",
     python_callable=run_post_ingestion_dq,
     provide_context=True,
-    on_failure_callback=failure_email_alert,
+    on_failure_callback=notify_failure,
     )
 
     notify_success = PythonOperator(
