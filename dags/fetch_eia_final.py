@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 import requests
 import json
 import os
+import logging
+
 
 # Config
 EIA_API_KEY = os.getenv("EIA_API_KEY")
@@ -46,47 +48,76 @@ def notify_success(**context):
     )
 
 def fetch_eia_fuel_data(**context):
+    """
+    Fetches daily fuel-type generation data from the EIA API and stores it as JSON.
+    Pushes file path and target date to XCom.
+    """
+    logging.info("==== [START] Fetch EIA Fuel Data ====")
+
     execution_date = context['execution_date']
     target_date = (execution_date - timedelta(days=1)).strftime("%Y-%m-%d")
+
     url = (
         f"https://api.eia.gov/v2/electricity/rto/daily-fuel-type-data/data/"
-        f"?api_key={EIA_API_KEY}"
-        f"&frequency=daily"
-        f"&data[0]=value"
+        f"?api_key={EIA_API_KEY}&frequency=daily&data[0]=value"
         f"&start={target_date}&end={target_date}"
         f"&sort[0][column]=period&sort[0][direction]=desc"
         f"&offset=0&length=5000"
     )
-    
+
+    logging.info(f"[Fetch] Requesting EIA data for date: {target_date}")
+    logging.info(f"[Fetch] URL: {url}")
+
     response = requests.get(url)
+    logging.info(f"[Fetch] HTTP Status: {response.status_code}")
+
     if response.status_code != 200:
-        raise Exception(f"Failed to fetch data: {response.status_code}, {response.text}")
+        logging.error(f"[Fetch] Failed API response: {response.text}")
+        raise Exception(f"Failed to fetch data: {response.status_code}")
 
     data = response.json()
 
+    # Save to file
     os.makedirs(DATA_DIR, exist_ok=True)
     file_path = os.path.join(DATA_DIR, f"eia_data_{target_date}.json")
     with open(file_path, "w") as f:
         json.dump(data, f, indent=2)
-    
+
+    logging.info(f"[Fetch] Saved raw JSON to: {file_path}")
+
+    # Push to XCom
     context['ti'].xcom_push(key='file_path', value=file_path)
     context['ti'].xcom_push(key='target_date', value=target_date)
-    print(f"Saved EIA data to {file_path}")
+
+    logging.info(f"[Fetch] XCom pushed: file_path={file_path}, target_date={target_date}")
+    logging.info("==== [END] Fetch EIA Fuel Data ====")
 
 def run_pre_ingestion_dq_fuel(**context):
+    """
+    Runs pre-ingestion data quality checks for EIA daily fuel data.
+    Validates schema, data types, nulls, uniqueness, and row count.
+    """
+    logging.info("==== [START] Pre-Ingestion DQ for EIA Fuel Data ====")
+
     file_path = context['ti'].xcom_pull(key='file_path')
     if not file_path or not os.path.exists(file_path):
+        logging.error("[DQ-Fuel] File not found at path: %s", file_path)
         raise AirflowException("Pre-ingestion DQ failed: file not found.")
+
+    logging.info("[DQ-Fuel] File path confirmed: %s", file_path)
 
     with open(file_path, "r") as f:
         data = json.load(f)
 
     records = data.get("response", {}).get("data", [])
     if not records:
+        logging.error("[DQ-Fuel] No records found in API response.")
         raise AirflowException("Pre-ingestion DQ failed: no data in file.")
 
     df = pd.DataFrame(records)
+    logging.info("[DQ-Fuel] Loaded %d records into DataFrame", len(df))
 
+    # Schema and data types to validate
     expected_schema = {
         "period": str,
         "respondent": str,
@@ -98,86 +129,139 @@ def run_pre_ingestion_dq_fuel(**context):
         "value-units": str
     }
 
+    # Step 1: Validate schema and types
     for col, expected_type in expected_schema.items():
         if col not in df.columns:
+            logging.error("[DQ-Fuel] Missing column in schema: %s", col)
             raise AirflowException(f"Missing column in schema: {col}")
-    
         try:
             if expected_type in [int, float, (int, float)]:
                 df[col] = pd.to_numeric(df[col], errors='raise')
             else:
                 df[col] = df[col].astype(str)
         except Exception as e:
+            logging.error("[DQ-Fuel] Type conversion failed for column %s: %s", col, str(e))
             raise AirflowException(f"Failed to convert column {col} to {expected_type}: {str(e)}")
+    logging.info("[DQ-Fuel] Schema and data types validated")
 
+    # Step 2: Null checks
     essential_cols = ["period", "respondent", "fueltype", "value"]
     for col in essential_cols:
         if df[col].isnull().any():
+            null_count = df[col].isnull().sum()
+            logging.error("[DQ-Fuel] Nulls found in column %s: %d", col, null_count)
             raise AirflowException(f"Null values found in {col}")
+    logging.info("[DQ-Fuel] Null check passed for essential columns")
 
+    # Step 3: Duplicate check on PK
     if df.duplicated(subset=["period", "respondent", "fueltype", "timezone"]).any():
+        logging.error("[DQ-Fuel] Duplicate rows found based on PK subset")
         raise AirflowException("Duplicate rows found based on PK subset")
+    logging.info("[DQ-Fuel] Duplicate check passed")
 
+    # Step 4: Row volume check
     row_count = len(df)
     if row_count < 100 or row_count > 10000:
+        logging.error("[DQ-Fuel] Volume check failed: %d rows", row_count)
         raise AirflowException(f"Volume check failed: {row_count} rows found")
+    logging.info("[DQ-Fuel] Row volume check passed (%d rows)", row_count)
+
+    logging.info("==== [END] Pre-Ingestion DQ for EIA Fuel Data ====")
 
 def load_eia_fuel_data(**context):
-    from psycopg2 import sql
+    """
+    Loads daily fuel-type generation data from a local JSON file into a PostgreSQL table.
+    - Reads metadata from XCom: `file_path` and `target_date`
+    - Creates table `eia_fuel_type_data` if it does not exist
+    - Inserts records with deduplication using ON CONFLICT
+    """
+    logging.info("==== [START] Load EIA Fuel Data ====")
 
+    # Pull metadata from XCom
     file_path = context['ti'].xcom_pull(key='file_path')
     target_date = context['ti'].xcom_pull(key='target_date')
+    logging.info(f"[Load] Retrieved file_path: {file_path}")
+    logging.info(f"[Load] Retrieved target_date: {target_date}")
+
+    if not os.path.exists(file_path):
+        logging.error(f"[Load] File does not exist: {file_path}")
+        raise FileNotFoundError(f"Data file not found: {file_path}")
 
     with open(file_path, "r") as f:
         data = json.load(f)
 
     records = data.get("response", {}).get("data", [])
     if not records:
-        print(f"No data found for {target_date}")
+        logging.warning(f"[Load] No data records found for {target_date}. Skipping insertion.")
         return
 
+    logging.info(f"[Load] Number of records to insert: {len(records)}")
+
+    # Connect to Postgres
     hook = PostgresHook(postgres_conn_id="postgres_default")
     conn = hook.get_conn()
     cursor = conn.cursor()
 
-    # 1. Create table if not exists
-    create_table_sql = """
-        CREATE TABLE IF NOT EXISTS eia_fuel_type_data (
-            period DATE,
-            respondent TEXT,
-            respondent_name TEXT,
-            fuel_type TEXT,
-            type_name TEXT,
-            timezone TEXT,
-            value NUMERIC,
-            value_units TEXT,
-            PRIMARY KEY (period, respondent, fuel_type, timezone)
-        );
-    """
-    cursor.execute(create_table_sql)
-    conn.commit()
+    try:
+        # Step 1: Create table
+        create_table_sql = """
+            CREATE TABLE IF NOT EXISTS eia_fuel_type_data (
+                period DATE,
+                respondent TEXT,
+                respondent_name TEXT,
+                fuel_type TEXT,
+                type_name TEXT,
+                timezone TEXT,
+                value NUMERIC,
+                value_units TEXT,
+                PRIMARY KEY (period, respondent, fuel_type, timezone)
+            );
+        """
+        cursor.execute(create_table_sql)
+        conn.commit()
+        logging.info("[Load] Table 'eia_fuel_type_data' ensured.")
 
-    # 2. Insert records
-    insert_sql = """
-        INSERT INTO eia_fuel_type_data (period, respondent, respondent_name, fuel_type, type_name, timezone, value, value_units)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (period, respondent, fuel_type, timezone)
-        DO NOTHING;
-    """
+        # Step 2: Insert records
+        insert_sql = """
+            INSERT INTO eia_fuel_type_data (
+                period, respondent, respondent_name, fuel_type, type_name, timezone, value, value_units
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (period, respondent, fuel_type, timezone)
+            DO NOTHING;
+        """
 
-    rows = [
-        (r["period"], r["respondent"], r["respondent-name"], r["fueltype"], r["type-name"], r["timezone"], r["value"], r["value-units"])
-        for r in records
-    ]
+        rows = [
+            (
+                r["period"], r["respondent"], r["respondent-name"],
+                r["fueltype"], r["type-name"], r["timezone"],
+                r["value"], r["value-units"]
+            )
+            for r in records
+        ]
 
-    cursor.executemany(insert_sql, rows)
-    conn.commit()
-    cursor.close()
-    conn.close()
+        cursor.executemany(insert_sql, rows)
+        conn.commit()
+        logging.info(f"[Load] Inserted {len(rows)} rows into 'eia_fuel_type_data'.")
 
-    print(f"Inserted {len(rows)} rows into Postgres.")
+    except Exception as e:
+        logging.error(f"[Load] Error inserting data: {str(e)}")
+        conn.rollback()
+        raise
+
+    finally:
+        cursor.close()
+        conn.close()
+        logging.info("[Load] Database connection closed.")
+
+    logging.info("==== [END] Load EIA Fuel Data ====")
 
 def fetch_eia_sales_data(**context):
+    """
+    Fetches monthly retail electricity sales data from the EIA API.
+    Saves the response as a JSON file and pushes its path to XCom.
+    """
+    logging.info("==== [START] Fetch EIA Sales Data ====")
+
     url = (
         "https://api.eia.gov/v2/electricity/retail-sales/data/"
         f"?api_key={EIA_API_KEY}"
@@ -188,35 +272,63 @@ def fetch_eia_sales_data(**context):
         "&data[3]=sales"
         "&sort[0][column]=period&sort[0][direction]=desc"
         "&offset=0&length=5000"
-        f"&start=2025-01"
+        "&start=2025-01"
     )
 
-    response = requests.get(url)
+    logging.info("[Sales Fetch] Requesting data from EIA API")
+    logging.info(f"[Sales Fetch] URL: {url}")
+
+    try:
+        response = requests.get(url)
+        logging.info(f"[Sales Fetch] HTTP Status Code: {response.status_code}")
+    except Exception as e:
+        logging.error(f"[Sales Fetch] Request failed: {str(e)}")
+        raise
+
     if response.status_code != 200:
+        logging.error(f"[Sales Fetch] API error: {response.text}")
         raise Exception(f"Failed to fetch monthly sales data: {response.status_code}, {response.text}")
 
     data = response.json()
-    file_path = os.path.join(DATA_DIR, f"eia_sales_data.json")
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    file_path = os.path.join(DATA_DIR, "eia_sales_data.json")
     with open(file_path, "w") as f:
         json.dump(data, f, indent=2)
 
+    logging.info(f"[Sales Fetch] Saved sales data to: {file_path}")
+
     context['ti'].xcom_push(key='sales_file_path', value=file_path)
+    logging.info(f"[Sales Fetch] XCom pushed: sales_file_path={file_path}")
+
+    logging.info("==== [END] Fetch EIA Sales Data ====")
 
 def run_pre_ingestion_dq_sales(**context):
+    """
+    Runs pre-ingestion data quality checks for EIA monthly sales data.
+    Validates schema, data types, nulls, uniqueness, and row count.
+    """
+    logging.info("==== [START] Pre-Ingestion DQ for EIA Sales Data ====")
+
     file_path = context['ti'].xcom_pull(key='sales_file_path')
     if not file_path or not os.path.exists(file_path):
+        logging.error("[DQ-Sales] File not found at path: %s", file_path)
         raise AirflowException("Pre-ingestion DQ failed: sales file not found.")
+
+    logging.info("[DQ-Sales] File path confirmed: %s", file_path)
 
     with open(file_path, "r") as f:
         data = json.load(f)
 
     records = data.get("response", {}).get("data", [])
     if not records:
+        logging.error("[DQ-Sales] No records found in sales file.")
         raise AirflowException("Pre-ingestion DQ failed: no sales data in file.")
 
     df = pd.DataFrame(records)
+    logging.info("[DQ-Sales] Loaded %d records into DataFrame", len(df))
 
-    # 1. Schema & data types
+    # Step 1: Schema and data type checks
     expected_schema = {
         "period": str,
         "stateid": str,
@@ -235,48 +347,72 @@ def run_pre_ingestion_dq_sales(**context):
 
     for col, expected_type in expected_schema.items():
         if col not in df.columns:
+            logging.error("[DQ-Sales] Missing column in schema: %s", col)
             raise AirflowException(f"[Sales DQ] Missing column: {col}")
-
         try:
             if expected_type in [int, float, (int, float)]:
                 df[col] = pd.to_numeric(df[col], errors='raise')
             else:
                 df[col] = df[col].astype(str)
         except Exception as e:
+            logging.error("[DQ-Sales] Failed to convert column %s: %s", col, str(e))
             raise AirflowException(f"[Sales DQ] Failed to convert column {col} to {expected_type}: {str(e)}")
+    logging.info("[DQ-Sales] Schema and data types validated")
 
-    # 2. Null checks for key columns
+    # Step 2: Null checks for essential columns
     essential_cols = ["period", "stateid", "sectorid"]
     for col in essential_cols:
         if df[col].isnull().any():
+            null_count = df[col].isnull().sum()
+            logging.error("[DQ-Sales] Nulls found in column %s: %d", col, null_count)
             raise AirflowException(f"[Sales DQ] Null values found in column: {col}")
+    logging.info("[DQ-Sales] Null check passed for essential columns")
 
-    # 3. Uniqueness check (composite key: period + stateid + sectorid)
+    # Step 3: Uniqueness check
     if df.duplicated(subset=["period", "stateid", "sectorid"]).any():
+        logging.error("[DQ-Sales] Duplicate rows found on period + stateid + sectorid")
         raise AirflowException("[Sales DQ] Duplicate rows found based on period+stateid+sectorid")
+    logging.info("[DQ-Sales] Duplicate check passed")
 
-    # 4. Volume check
+    # Step 4: Row volume check
     row_count = len(df)
     if row_count < 100 or row_count > 10000:
+        logging.error("[DQ-Sales] Volume check failed: %d rows", row_count)
         raise AirflowException(f"[Sales DQ] Volume check failed: {row_count} rows found")
+    logging.info("[DQ-Sales] Row volume check passed (%d rows)", row_count)
 
-    print("Pre-ingestion DQ for sales data passed.")
+    logging.info("==== [END] Pre-Ingestion DQ for EIA Sales Data ====")
 
 def load_eia_sales_data(**context):
+    """
+    Loads EIA monthly sales data from JSON file and inserts it into Postgres.
+    Assumes data has already been pre-validated and saved to disk.
+    """
+    logging.info("==== [START] Load EIA Sales Data into Postgres ====")
+
     file_path = context['ti'].xcom_pull(key='sales_file_path')
+    logging.info(f"[Sales Load] Retrieved file path from XCom: {file_path}")
+
+    if not file_path or not os.path.exists(file_path):
+        logging.error("[Sales Load] JSON file not found.")
+        raise FileNotFoundError(f"File not found: {file_path}")
 
     with open(file_path, "r") as f:
         data = json.load(f)
 
     records = data.get("response", {}).get("data", [])
     if not records:
-        print("No sales data found")
+        logging.warning("[Sales Load] No records found in the sales dataset.")
         return
+
+    logging.info(f"[Sales Load] {len(records)} records loaded from file")
 
     hook = PostgresHook(postgres_conn_id="postgres_default")
     conn = hook.get_conn()
     cursor = conn.cursor()
+    logging.info("[Sales Load] Connected to Postgres")
 
+    # Step 1: Create table if not exists
     create_table_sql = """
         CREATE TABLE IF NOT EXISTS eia_monthly_sales (
             period DATE,
@@ -295,7 +431,10 @@ def load_eia_sales_data(**context):
         );
     """
     cursor.execute(create_table_sql)
+    conn.commit()
+    logging.info("[Sales Load] Ensured table eia_monthly_sales exists")
 
+    # Step 2: Prepare insert
     insert_sql = """
         INSERT INTO eia_monthly_sales (
             period, state_id, state_desc, sector_id, sector_name,
@@ -306,20 +445,25 @@ def load_eia_sales_data(**context):
 
     rows = [
         (
-            f"{r['period']}-01", r["stateid"], r["stateDescription"],
-            r["sectorid"], r["sectorName"], r["customers"], r["price"],
-            r["revenue"], r["sales"], r["customers-units"],
-            r["price-units"], r["revenue-units"], r["sales-units"]
+            f"{r['period']}-01",  # Append day to make a full date
+            r["stateid"], r["stateDescription"],
+            r["sectorid"], r["sectorName"],
+            r["customers"], r["price"], r["revenue"], r["sales"],
+            r["customers-units"], r["price-units"], r["revenue-units"], r["sales-units"]
         )
         for r in records
     ]
 
     cursor.executemany(insert_sql, rows)
     conn.commit()
+
+    logging.info(f"[Sales Load] Inserted {len(rows)} rows into eia_monthly_sales")
+
     cursor.close()
     conn.close()
+    logging.info("[Sales Load] Database connection closed")
 
-    print(f"Inserted {len(rows)} rows into eia_monthly_sales.")
+    logging.info("==== [END] Load EIA Sales Data into Postgres ====")
 
 def run_post_ingestion_dq(**context):
     from airflow.hooks.postgres_hook import PostgresHook
