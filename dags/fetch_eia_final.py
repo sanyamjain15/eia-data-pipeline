@@ -18,33 +18,61 @@ EMAIL_ID = os.getenv("SMTP_USER")
 DATA_DIR = "/opt/airflow/data"
 
 def failure_email_alert(context):
-    dag_id = context.get('dag').dag_id
-    task_id = context.get('task_instance').task_id
-    execution_date = context.get('execution_date')
-    log_url = context.get('task_instance').log_url
-    subject = f"[Airflow Alert] DAG {dag_id} Task {task_id} Failed"
-    html_content = f"""
-        Task {task_id} in DAG {dag_id} failed on {execution_date}. <br>
-        <a href="{log_url}">Log link</a>
     """
-    send_email(to=[str(EMAIL_ID)], subject=subject, html_content=html_content)
-
-def render_success_email(**context):
-    dq_report = context['ti'].xcom_pull(task_ids='post_ingestion_dq_check', key='dq_report') or "No DQ report available."
-
-    return f"""
-    <h3>DAG succeeded!</h3>
-    <p>Your DAG <strong>eia_daily_ingestion</strong> ran successfully on <strong>{context['ds']}</strong>.</p>
-    <h4>Data Quality Report</h4>
-    {dq_report}
+    Sends an email alert when any task fails in the DAG.
+    Includes task name, dag id, error details, and execution date.
     """
+    from airflow.utils.email import send_email
+
+    dag_id = context.get("dag").dag_id
+    task_id = context.get("task_instance").task_id
+    execution_date = context.get("ds")
+    exception = context.get("exception")
+
+    subject = f"[ALERT] Airflow Task Failed: {dag_id}.{task_id}"
+    body = f"""
+    <h2>❌ Airflow Task Failure Alert</h2>
+    <p><b>DAG:</b> {dag_id}<br>
+       <b>Task:</b> {task_id}<br>
+       <b>Execution Date:</b> {execution_date}</p>
+    <h3 style="color:red;">Error Details</h3>
+    <pre>{str(exception)[:1000]}</pre>
+    <p>Check the Airflow UI for full logs.</p>
+    """
+
+    send_email(
+        to=[str(EMAIL_ID)],  # Update to team distro if needed
+        subject=subject,
+        html_content=body
+    )
 
 def notify_success(**context):
-    html_content = render_success_email(**context)
+    """
+    Sends a success email after the DAG completes.
+    Includes post-ingestion DQ results and row ingestion summary.
+    """
+    from airflow.utils.email import send_email
+
+    dag_run = context.get('dag_run')
+    execution_date = context.get('ds')
+    dag_id = context.get('dag').dag_id
+
+    # Pull the HTML DQ report from XCom
+    dq_report = context['ti'].xcom_pull(task_ids='post_ingestion_dq_check', key='dq_report') or "<p>No report generated.</p>"
+
+    subject = f"[SUCCESS] DAG '{dag_id}' - {execution_date}"
+    body = f"""
+    <h2>✅ Daily EIA Data Ingestion Successful</h2>
+    <p>DAG ID: <b>{dag_id}</b><br>
+    Execution Date: <b>{execution_date}</b></p>
+    {dq_report}
+    <p style="color:gray; font-size:0.9em;">This is an automated report from Airflow.</p>
+    """
+
     send_email(
-        to=[str(EMAIL_ID)],
-        subject=f"Airflow DAG Succeeded: eia_daily_ingestion ({context['ds']})",
-        html_content=html_content
+        to=[str(EMAIL_ID)],  # Replace or generalize as needed
+        subject=subject,
+        html_content=body
     )
 
 def fetch_eia_fuel_data(**context):
@@ -242,6 +270,9 @@ def load_eia_fuel_data(**context):
         cursor.executemany(insert_sql, rows)
         conn.commit()
         logging.info(f"[Load] Inserted {len(rows)} rows into 'eia_fuel_type_data'.")
+
+        # Push inserted row count to XCom for reporting
+        context['ti'].xcom_push(key='eia_fuel_type_data_inserted_count', value=len(rows))
 
     except Exception as e:
         logging.error(f"[Load] Error inserting data: {str(e)}")
@@ -459,6 +490,9 @@ def load_eia_sales_data(**context):
 
     logging.info(f"[Sales Load] Inserted {len(rows)} rows into eia_monthly_sales")
 
+    # Push inserted row count to XCom for reporting
+    context['ti'].xcom_push(key='eia_monthly_sales_inserted_count', value=len(rows))
+
     cursor.close()
     conn.close()
     logging.info("[Sales Load] Database connection closed")
@@ -472,33 +506,60 @@ def run_post_ingestion_dq(**context):
     conn = hook.get_conn()
     cursor = conn.cursor()
 
+    # Step 1: Post-ingestion DQ Checks
     dq_checks = [
         {
-            "check_name": "Check value is non-negative",
+            "table": "eia_fuel_type_data",
+            "check_name": "Value should be non-negative",
             "sql": "SELECT COUNT(*) FROM eia_fuel_type_data WHERE value < 0;",
             "expected_result": 0,
         },
         {
-            "check_name": "Check no nulls in period",
+            "table": "eia_fuel_type_data",
+            "check_name": "No NULLs in period",
             "sql": "SELECT COUNT(*) FROM eia_fuel_type_data WHERE period IS NULL;",
             "expected_result": 0,
         },
-        # Add more checks here...
+        {
+            "table": "eia_monthly_sales",
+            "check_name": "No NULLs in state_id",
+            "sql": "SELECT COUNT(*) FROM eia_monthly_sales WHERE state_id IS NULL;",
+            "expected_result": 0,
+        },
     ]
 
-    report_lines = ["<table border='1'><tr><th>Check</th><th>Status</th><th>Actual</th><th>Expected</th></tr>"]
+    dq_results = []
+    report_lines = ["<h3>Post-Ingestion Data Quality Checks</h3>"]
+    report_lines.append("<table border='1'><tr><th>Table</th><th>Check</th><th>Status</th><th>Actual</th><th>Expected</th></tr>")
+
     for check in dq_checks:
         cursor.execute(check["sql"])
-        actual_result = cursor.fetchone()[0]
-        status = "✅ Passed" if actual_result == check["expected_result"] else "❌ Failed"
+        actual = cursor.fetchone()[0]
+        status = "✅ Passed" if actual == check["expected_result"] else "❌ Failed"
 
+        dq_results.append((check["table"], check["check_name"], status, actual, check["expected_result"]))
         report_lines.append(
-            f"<tr><td>{check['check_name']}</td><td>{status}</td><td>{actual_result}</td><td>{check['expected_result']}</td></tr>"
+            f"<tr><td>{check['table']}</td><td>{check['check_name']}</td><td>{status}</td><td>{actual}</td><td>{check['expected_result']}</td></tr>"
         )
 
     report_lines.append("</table>")
-    dq_report = "\n".join(report_lines)
 
+    # Step 2: Row Ingestion Summary
+    row_tables = ["eia_fuel_type_data", "eia_monthly_sales"]
+    ingestion_lines = ["<h3>Row Ingestion Summary</h3>"]
+    ingestion_lines.append("<table border='1'><tr><th>Table</th><th>Previous</th><th>Inserted</th><th>Current</th></tr>")
+
+    for table in row_tables:
+        # Use XCom-pushed value from insertion tasks
+        inserted = context['ti'].xcom_pull(key=f'{table}_inserted_count') or 0
+        cursor.execute(f"SELECT COUNT(*) FROM {table};")
+        current = cursor.fetchone()[0]
+        previous = current - inserted
+        ingestion_lines.append(f"<tr><td>{table}</td><td>{previous}</td><td>{inserted}</td><td>{current}</td></tr>")
+
+    ingestion_lines.append("</table>")
+
+    dq_report = "\n".join(report_lines + ingestion_lines)
     context['ti'].xcom_push(key='dq_report', value=dq_report)
 
     cursor.close()
