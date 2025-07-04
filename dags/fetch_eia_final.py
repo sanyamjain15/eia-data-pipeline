@@ -15,28 +15,6 @@ EIA_API_KEY = os.getenv("EIA_API_KEY")
 EMAIL_ID = os.getenv("SMTP_USER")
 DATA_DIR = "/opt/airflow/data"
 
-def data_quality_check(**kwargs):
-    hook = PostgresHook(postgres_conn_id="postgres_default")
-    conn = hook.get_conn()
-    query = "SELECT * FROM eia_fuel_type_data"
-    df = pd.read_sql("SELECT * FROM eia_fuel_type_data", conn)
-
-    checks = [
-        ("Check for null periods", df["period"].isnull().sum() == 0),
-        ("Check for null respondents", df["respondent"].isnull().sum() == 0),
-        ("Check for null fuel_type", df["fuel_type"].isnull().sum() == 0),
-        ("Check for null type_name", df["type_name"].isnull().sum() == 0),
-        ("Check for valid fuel types", df["fuel_type"].isin(
-            ['OES', 'SUN', 'NUC', 'UNK', 'NG', 'OTH', 'GEO', 'PS', 'WNB', 'COL', 'UES', 'WAT', 'OIL', 'SNB', 'WND', 'BAT']
-        ).all()),
-    ]
-
-    for check_name, passed in checks:
-        if not passed:
-            raise AirflowException(f"Data quality check failed: {check_name}")
-
-    # Add more checks as needed
-
 def failure_email_alert(context):
     dag_id = context.get('dag').dag_id
     task_id = context.get('task_instance').task_id
@@ -67,7 +45,7 @@ def notify_success(**context):
         html_content=html_content
     )
 
-def fetch_eia_data(**context):
+def fetch_eia_fuel_data(**context):
     execution_date = context['execution_date']
     target_date = (execution_date - timedelta(days=1)).strftime("%Y-%m-%d")
     url = (
@@ -95,7 +73,111 @@ def fetch_eia_data(**context):
     context['ti'].xcom_push(key='target_date', value=target_date)
     print(f"Saved EIA data to {file_path}")
 
-def fetch_monthly_sales_data(**context):
+def run_pre_ingestion_dq_fuel(**context):
+    file_path = context['ti'].xcom_pull(key='file_path')
+    if not file_path or not os.path.exists(file_path):
+        raise AirflowException("Pre-ingestion DQ failed: file not found.")
+
+    with open(file_path, "r") as f:
+        data = json.load(f)
+
+    records = data.get("response", {}).get("data", [])
+    if not records:
+        raise AirflowException("Pre-ingestion DQ failed: no data in file.")
+
+    df = pd.DataFrame(records)
+
+    expected_schema = {
+        "period": str,
+        "respondent": str,
+        "respondent-name": str,
+        "fueltype": str,
+        "type-name": str,
+        "timezone": str,
+        "value": (int, float),
+        "value-units": str
+    }
+
+    for col, expected_type in expected_schema.items():
+        if col not in df.columns:
+            raise AirflowException(f"Missing column in schema: {col}")
+    
+        try:
+            if expected_type in [int, float, (int, float)]:
+                df[col] = pd.to_numeric(df[col], errors='raise')
+            else:
+                df[col] = df[col].astype(str)
+        except Exception as e:
+            raise AirflowException(f"Failed to convert column {col} to {expected_type}: {str(e)}")
+
+    essential_cols = ["period", "respondent", "fueltype", "value"]
+    for col in essential_cols:
+        if df[col].isnull().any():
+            raise AirflowException(f"Null values found in {col}")
+
+    if df.duplicated(subset=["period", "respondent", "fueltype", "timezone"]).any():
+        raise AirflowException("Duplicate rows found based on PK subset")
+
+    row_count = len(df)
+    if row_count < 100 or row_count > 10000:
+        raise AirflowException(f"Volume check failed: {row_count} rows found")
+
+def load_eia_fuel_data(**context):
+    from psycopg2 import sql
+
+    file_path = context['ti'].xcom_pull(key='file_path')
+    target_date = context['ti'].xcom_pull(key='target_date')
+
+    with open(file_path, "r") as f:
+        data = json.load(f)
+
+    records = data.get("response", {}).get("data", [])
+    if not records:
+        print(f"No data found for {target_date}")
+        return
+
+    hook = PostgresHook(postgres_conn_id="postgres_default")
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+
+    # 1. Create table if not exists
+    create_table_sql = """
+        CREATE TABLE IF NOT EXISTS eia_fuel_type_data (
+            period DATE,
+            respondent TEXT,
+            respondent_name TEXT,
+            fuel_type TEXT,
+            type_name TEXT,
+            timezone TEXT,
+            value NUMERIC,
+            value_units TEXT,
+            PRIMARY KEY (period, respondent, fuel_type, timezone)
+        );
+    """
+    cursor.execute(create_table_sql)
+    conn.commit()
+
+    # 2. Insert records
+    insert_sql = """
+        INSERT INTO eia_fuel_type_data (period, respondent, respondent_name, fuel_type, type_name, timezone, value, value_units)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (period, respondent, fuel_type, timezone)
+        DO NOTHING;
+    """
+
+    rows = [
+        (r["period"], r["respondent"], r["respondent-name"], r["fueltype"], r["type-name"], r["timezone"], r["value"], r["value-units"])
+        for r in records
+    ]
+
+    cursor.executemany(insert_sql, rows)
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    print(f"Inserted {len(rows)} rows into Postgres.")
+
+def fetch_eia_sales_data(**context):
     url = (
         "https://api.eia.gov/v2/electricity/retail-sales/data/"
         f"?api_key={EIA_API_KEY}"
@@ -120,7 +202,67 @@ def fetch_monthly_sales_data(**context):
 
     context['ti'].xcom_push(key='sales_file_path', value=file_path)
 
-def load_monthly_sales_to_postgres(**context):
+def run_pre_ingestion_dq_sales(**context):
+    file_path = context['ti'].xcom_pull(key='sales_file_path')
+    if not file_path or not os.path.exists(file_path):
+        raise AirflowException("Pre-ingestion DQ failed: sales file not found.")
+
+    with open(file_path, "r") as f:
+        data = json.load(f)
+
+    records = data.get("response", {}).get("data", [])
+    if not records:
+        raise AirflowException("Pre-ingestion DQ failed: no sales data in file.")
+
+    df = pd.DataFrame(records)
+
+    # 1. Schema & data types
+    expected_schema = {
+        "period": str,
+        "stateid": str,
+        "stateDescription": str,
+        "sectorid": str,
+        "sectorName": str,
+        "customers": (int, float),
+        "price": (int, float),
+        "revenue": (int, float),
+        "sales": (int, float),
+        "customers-units": str,
+        "price-units": str,
+        "revenue-units": str,
+        "sales-units": str,
+    }
+
+    for col, expected_type in expected_schema.items():
+        if col not in df.columns:
+            raise AirflowException(f"[Sales DQ] Missing column: {col}")
+
+        try:
+            if expected_type in [int, float, (int, float)]:
+                df[col] = pd.to_numeric(df[col], errors='raise')
+            else:
+                df[col] = df[col].astype(str)
+        except Exception as e:
+            raise AirflowException(f"[Sales DQ] Failed to convert column {col} to {expected_type}: {str(e)}")
+
+    # 2. Null checks for key columns
+    essential_cols = ["period", "stateid", "sectorid"]
+    for col in essential_cols:
+        if df[col].isnull().any():
+            raise AirflowException(f"[Sales DQ] Null values found in column: {col}")
+
+    # 3. Uniqueness check (composite key: period + stateid + sectorid)
+    if df.duplicated(subset=["period", "stateid", "sectorid"]).any():
+        raise AirflowException("[Sales DQ] Duplicate rows found based on period+stateid+sectorid")
+
+    # 4. Volume check
+    row_count = len(df)
+    if row_count < 100 or row_count > 10000:
+        raise AirflowException(f"[Sales DQ] Volume check failed: {row_count} rows found")
+
+    print("Pre-ingestion DQ for sales data passed.")
+
+def load_eia_sales_data(**context):
     file_path = context['ti'].xcom_pull(key='sales_file_path')
 
     with open(file_path, "r") as f:
@@ -179,61 +321,6 @@ def load_monthly_sales_to_postgres(**context):
 
     print(f"Inserted {len(rows)} rows into eia_monthly_sales.")
 
-def load_to_postgres(**context):
-    from psycopg2 import sql
-
-    file_path = context['ti'].xcom_pull(key='file_path')
-    target_date = context['ti'].xcom_pull(key='target_date')
-
-    with open(file_path, "r") as f:
-        data = json.load(f)
-
-    records = data.get("response", {}).get("data", [])
-    if not records:
-        print(f"No data found for {target_date}")
-        return
-
-    hook = PostgresHook(postgres_conn_id="postgres_default")
-    conn = hook.get_conn()
-    cursor = conn.cursor()
-
-    # 1. Create table if not exists
-    create_table_sql = """
-        CREATE TABLE IF NOT EXISTS eia_fuel_type_data (
-            period DATE,
-            respondent TEXT,
-            respondent_name TEXT,
-            fuel_type TEXT,
-            type_name TEXT,
-            timezone TEXT,
-            value NUMERIC,
-            value_units TEXT,
-            PRIMARY KEY (period, respondent, fuel_type, timezone)
-        );
-    """
-    cursor.execute(create_table_sql)
-    conn.commit()
-
-    # 2. Insert records
-    insert_sql = """
-        INSERT INTO eia_fuel_type_data (period, respondent, respondent_name, fuel_type, type_name, timezone, value, value_units)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (period, respondent, fuel_type, timezone)
-        DO NOTHING;
-    """
-
-    rows = [
-        (r["period"], r["respondent"], r["respondent-name"], r["fueltype"], r["type-name"], r["timezone"], r["value"], r["value-units"])
-        for r in records
-    ]
-
-    cursor.executemany(insert_sql, rows)
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-    print(f"Inserted {len(rows)} rows into Postgres.")
-
 def run_post_ingestion_dq(**context):
     from airflow.hooks.postgres_hook import PostgresHook
 
@@ -291,9 +378,9 @@ with DAG(
     tags=["eia", "postgres"],
 ) as dag:
 
-    fetch_task = PythonOperator(
-    task_id="fetch_eia_data",
-    python_callable=fetch_eia_data,
+    fetch_fuel_task = PythonOperator(
+    task_id="fetch_eia_fuel_data",
+    python_callable=fetch_eia_fuel_data,
     retries=3,
     retry_delay=timedelta(minutes=5),
     execution_timeout=timedelta(minutes=2),
@@ -301,32 +388,39 @@ with DAG(
     on_failure_callback=failure_email_alert,
     )
 
-    load_task = PythonOperator(
-    task_id="load_to_postgres",
-    python_callable=load_to_postgres,
+    pre_dq_check_fuel = PythonOperator(
+        task_id="run_pre_ingestion_dq_fuel",
+        python_callable=run_pre_ingestion_dq_fuel,
+        provide_context=True,
+        on_failure_callback=failure_email_alert,
+    )
+
+    load_fuel_task = PythonOperator(
+    task_id="load_eia_fuel_data",
+    python_callable=load_eia_fuel_data,
     provide_context=True,
     on_failure_callback=failure_email_alert,
     )
 
+    pre_dq_check_sales = PythonOperator(
+    task_id="run_pre_ingestion_dq_sales",
+    python_callable=run_pre_ingestion_dq_sales,
+    provide_context=True,
+    on_failure_callback=failure_email_alert,
+    )
 
     fetch_sales_task = PythonOperator(
-    task_id="fetch_monthly_sales_data",
-    python_callable=fetch_monthly_sales_data,
+    task_id="fetch_eia_sales_data",
+    python_callable=fetch_eia_sales_data,
     provide_context=True,
     on_failure_callback=failure_email_alert,
     )
 
     load_sales_task = PythonOperator(
-    task_id="load_monthly_sales_to_postgres",
-    python_callable=load_monthly_sales_to_postgres,
+    task_id="load_eia_sales_data",
+    python_callable=load_eia_sales_data,
     provide_context=True,
     on_failure_callback=failure_email_alert,
-    )
-
-    check_data_quality = PythonOperator(
-    task_id="check_data_quality",
-    python_callable=data_quality_check,
-    trigger_rule="none_failed_min_one_success",
     )
 
     post_dq_check = PythonOperator(
@@ -344,9 +438,8 @@ with DAG(
     )
 
 
-    # Set up independent branches
-    fetch_task >> load_task
-    fetch_sales_task >> load_sales_task
+    # DAG structure
+    fetch_fuel_task >> pre_dq_check_fuel >> load_fuel_task
+    fetch_sales_task >> pre_dq_check_sales >> load_sales_task
 
-    # Continue only if at least one pipeline succeeded
-    [load_task, load_sales_task] >> check_data_quality >> post_dq_check >> notify_success
+    [load_fuel_task, load_sales_task] >> post_dq_check >> notify_success
