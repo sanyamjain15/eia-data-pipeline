@@ -1,3 +1,9 @@
+# dbt
+.dbt/
+dbt/eia_dbt/target/
+dbt/eia_dbt/dbt_packages/
+dbt/eia_dbt/__pycache__/
+
 # Python
 __pycache__/
 *.pyc
