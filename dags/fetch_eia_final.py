@@ -22,7 +22,6 @@ def notify_failure(context):
     Sends an email alert when any task fails in the DAG.
     Includes task name, dag id, error details, and execution date.
     """
-    from airflow.utils.email import send_email
 
     dag_id = context.get("dag").dag_id
     task_id = context.get("task_instance").task_id
@@ -51,7 +50,6 @@ def notify_success(**context):
     Sends a success email after the DAG completes.
     Includes post-ingestion DQ results and row ingestion summary.
     """
-    from airflow.utils.email import send_email
 
     dag_run = context.get('dag_run')
     execution_date = context.get('ds')
@@ -500,7 +498,6 @@ def load_eia_sales_data(**context):
     logging.info("==== [END] Load EIA Sales Data into Postgres ====")
 
 def run_post_ingestion_dq(**context):
-    from airflow.hooks.postgres_hook import PostgresHook
 
     hook = PostgresHook(postgres_conn_id="postgres_default")
     conn = hook.get_conn()
